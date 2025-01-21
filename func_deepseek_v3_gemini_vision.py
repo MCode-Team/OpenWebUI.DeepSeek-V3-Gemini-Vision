@@ -1,9 +1,9 @@
 """
-title: Deepseek R1 Manifold Pipe with Gemini Vision Support
-authors: [MCode-Team]
-author_url: [https://github.com/MCode-Team/OpenWebUI.DeepSeek-V3-Gemini-Vision]
+title: Deepseek V3/R1 Manifold Pipe with Gemini Vision Support
+authors: [MCode-Team, Ethan Copping]
+author_url: [https://github.com/MCode-Team, https://github.com/CoppingEthan]
 funding_url: https://github.com/open-webui
-version: 0.1.3
+version: 0.1.5
 required_open_webui_version: 0.5.0
 license: MIT
 environment_variables:
@@ -16,6 +16,10 @@ System:
 2. Combines the image description with the text.  
 3. Sends the combined content to DeepSeek for processing.  
 4. DeepSeek responds back.
+
+# Acknowledgments
+Adapted code from [Ethan Copping] to add realtime preview of the thinking process for Deepseek R1
+
 """
 
 import os
@@ -296,15 +300,6 @@ class Pipe:
             processed_messages = await self.process_messages(
                 messages, __event_emitter__
             )
-
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {"description": "Processing request...", "done": False},
-                    }
-                )
-
             if "model" not in body:
                 raise ValueError("Model name is required")
 
@@ -335,12 +330,20 @@ class Pipe:
                 ),
                 "stream": body.get("stream", False),
             }
-
             payload = {k: v for k, v in payload.items() if v is not None}
+
             headers = {
                 "Authorization": f"Bearer {self.valves.DEEPSEEK_API_KEY}",
                 "Content-Type": "application/json",
             }
+
+            if __event_emitter__ and model_id == "deepseek-reasoner":
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": "thinking...", "done": False},
+                    }
+                )
 
             if payload["stream"]:
                 return self._stream_response(
@@ -348,6 +351,7 @@ class Pipe:
                     headers=headers,
                     payload=payload,
                     __event_emitter__=__event_emitter__,
+                    model_id=model_id,
                 )
 
             async with aiohttp.ClientSession() as session:
@@ -377,17 +381,12 @@ class Pipe:
                         message = result["choices"][0]["message"]
                         content = message.get("content") or ""
                         reasoning_content = message.get("reasoning_content") or ""
-
-                        # Combine content and reasoning with XML tags
                         combined_content = ""
                         if reasoning_content:
                             combined_content += f"<{self.valves.THINK_XML_TAG}>\n{reasoning_content.strip()}\n</{self.valves.THINK_XML_TAG}>\n\n"
                         combined_content += content
-
-                        # Apply formatting
                         final_response = self.format_thinking_tags(combined_content)
-
-                        if __event_emitter__:
+                        if __event_emitter__ and model_id == "deepseek-reasoner":
                             await __event_emitter__(
                                 {
                                     "type": "status",
@@ -409,22 +408,23 @@ class Pipe:
             return {"content": error_msg, "format": "text"}
 
     async def _stream_response(
-        self, url: str, headers: dict, payload: dict, __event_emitter__=None
+        self,
+        url: str,
+        headers: dict,
+        payload: dict,
+        __event_emitter__=None,
+        model_id: str = "",
     ) -> AsyncIterator[str]:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=payload) as response:
-                    if __event_emitter__:
+                    if __event_emitter__ and model_id == "deepseek-reasoner":
                         await __event_emitter__(
                             {
                                 "type": "status",
-                                "data": {
-                                    "description": "Processing request...",
-                                    "done": False,
-                                },
+                                "data": {"description": "thinking...", "done": False},
                             }
                         )
-
                     if response.status != 200:
                         error_msg = (
                             f"Error: HTTP {response.status}: {await response.text()}"
@@ -441,7 +441,9 @@ class Pipe:
 
                     reasoning_content = ""
                     content = ""
-                    reasoning_yielded = False
+                    is_thinking = False
+                    last_status_update = time.time()
+                    status_dots = 0
 
                     async for line in response.content:
                         if line and line.startswith(b"data: "):
@@ -450,48 +452,60 @@ class Pipe:
                                 if "choices" in data and len(data["choices"]) > 0:
                                     delta = data["choices"][0].get("delta", {})
 
-                                    # Accumulate reasoning content
+                                    # Handle reasoning content (thinking phase)
                                     if (
                                         "reasoning_content" in delta
                                         and delta["reasoning_content"]
                                     ):
-                                        reasoning_content += delta["reasoning_content"]
+                                        if not is_thinking:
+                                            is_thinking = True
+                                            yield "> "  # Start blockquote only once
 
-                                    # Handle content chunks
+                                        delta_text = delta["reasoning_content"]
+                                        # Handle new lines in thinking content
+                                        if "\n" in delta_text:
+                                            delta_text = delta_text.replace(
+                                                "\n", "\n> "
+                                            )
+                                        yield delta_text
+                                        reasoning_content += delta_text
+
+                                    # Handle final response content
                                     if "content" in delta and delta["content"]:
+                                        if is_thinking:
+                                            is_thinking = False
+                                            yield "\n\n"  # Add separation between thinking and response
+
                                         content_chunk = delta["content"]
                                         content += content_chunk
-
-                                        # If reasoning hasn't been yielded yet, process and yield it
-                                        if (
-                                            not reasoning_yielded
-                                            and reasoning_content.strip()
-                                        ):
-                                            formatted_reasoning = self.format_thinking_tags(
-                                                f"<{self.valves.THINK_XML_TAG}>\n{reasoning_content.strip()}\n</{self.valves.THINK_XML_TAG}>"
-                                            )
-                                            yield formatted_reasoning + "\n\n"
-                                            reasoning_yielded = True
-
                                         yield content_chunk
 
-                                    # Handle stream completion
+                                    if (
+                                        model_id == "deepseek-reasoner"
+                                        and __event_emitter__
+                                    ):
+                                        current_time = time.time()
+                                        if current_time - last_status_update > 1:
+                                            status_dots = (status_dots % 3) + 1
+                                            await __event_emitter__(
+                                                {
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": f"thinking{'...'[:status_dots]}",
+                                                        "done": False,
+                                                    },
+                                                }
+                                            )
+                                            last_status_update = current_time
+
                                     if (
                                         data["choices"][0].get("finish_reason")
                                         == "stop"
                                     ):
-                                        # Yield remaining reasoning first
                                         if (
-                                            not reasoning_yielded
-                                            and reasoning_content.strip()
+                                            __event_emitter__
+                                            and model_id == "deepseek-reasoner"
                                         ):
-                                            formatted_reasoning = self.format_thinking_tags(
-                                                f"<{self.valves.THINK_XML_TAG}>\n{reasoning_content.strip()}\n</{self.valves.THINK_XML_TAG}>"
-                                            )
-                                            yield f"{formatted_reasoning}\n\n"
-
-                                        # Emit completion status
-                                        if __event_emitter__:
                                             await __event_emitter__(
                                                 {
                                                     "type": "status",
@@ -502,6 +516,7 @@ class Pipe:
                                                 }
                                             )
                                         break
+
                             except json.JSONDecodeError as e:
                                 logging.error(
                                     f"Failed to parse streaming response: {e}"
