@@ -1,9 +1,9 @@
 """
-title: DeepSeek Manifold Pipe with Gemini Vision Support
+title: Deepseek R1 Manifold Pipe with Gemini Vision Support
 authors: [MCode-Team]
 author_url: [https://github.com/MCode-Team/OpenWebUI.DeepSeek-V3-Gemini-Vision]
 funding_url: https://github.com/open-webui
-version: 0.1.2
+version: 0.1.3
 required_open_webui_version: 0.5.0
 license: MIT
 environment_variables:
@@ -24,6 +24,7 @@ import time
 import logging
 import requests
 import aiohttp
+import re
 import google.generativeai as genai
 from typing import (
     List,
@@ -46,17 +47,21 @@ class CacheEntry:
 
 
 class Pipe:
-    API_URL = "https://api.deepseek.com/v1/chat/completions"
     SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"]
     MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB per image
     TOTAL_MAX_IMAGE_SIZE = 100 * 1024 * 1024  # 100MB total
     REQUEST_TIMEOUT = (3.05, 60)
     CACHE_EXPIRATION = 30 * 60  # 30 minutes in seconds
     MODEL_MAX_TOKENS = {
-        "deepseek-chat": 4096,
+        "deepseek-chat": 8192,
+        "deepseek-reasoner": 8192,
     }
 
     class Valves(BaseModel):
+        DEEPSEEK_BASE_URL: str = Field(
+            default=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            description="Your DeepSeek Base URL",
+        )
         DEEPSEEK_API_KEY: str = Field(
             default=os.getenv("DEEPSEEK_API_KEY", ""),
             description="Your DeepSeek API key",
@@ -65,25 +70,45 @@ class Pipe:
             default=os.getenv("GOOGLE_API_KEY", ""),
             description="Your Google API key for image processing",
         )
+        THINK_XML_TAG: str = Field(
+            default=os.getenv("THINK_XML_TAG", "thinking"),
+            description="XML tag used for thinking content",
+        )
 
     def __init__(self):
         logging.basicConfig(level=logging.INFO)
         self.type = "manifold"
         self.id = "deepseek"
+        self.name = "deepseek/"
         self.valves = self.Valves()
         self.request_id = None
         self.image_cache = {}
 
-    def get_deepseek_models(self) -> List[dict]:
-        return [
-            {
-                "id": f"deepseek/{name}",
-                "name": name,
-                "context_length": self.MODEL_MAX_TOKENS.get(name, 4096),
-                "supports_vision": True,
+    @staticmethod
+    def get_model_id(model_name: str) -> str:
+        """Extract just the base model name from any format"""
+        return model_name.replace(".", "/").split("/")[-1]
+
+    def get_deepseek_models(self) -> List[Dict[str, str]]:
+        """Fetch available models from Deepseek API"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.valves.DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json",
             }
-            for name in ["deepseek-chat"]
-        ]
+            response = requests.get(
+                f"{self.valves.DEEPSEEK_BASE_URL}/models", headers=headers, timeout=10
+            )
+            response.raise_for_status()
+            models_data = response.json()
+            return [
+                {"id": model["id"], "name": model["id"]}
+                for model in models_data.get("data", [])
+            ]
+        except Exception as e:
+            if DEBUG:
+                print(f"Error getting models: {e}")
+            return []
 
     def pipes(self) -> List[dict]:
         return self.get_deepseek_models()
@@ -240,6 +265,21 @@ class Pipe:
 
         return processed_messages
 
+    def format_thinking_tags(self, text: str) -> str:
+        """Format content within thinking XML tags into markdown blockquotes."""
+        pattern = r"<{}>(.*?)</{}>".format(
+            re.escape(self.valves.THINK_XML_TAG), re.escape(self.valves.THINK_XML_TAG)
+        )
+        regex = re.compile(pattern, flags=re.DOTALL)
+
+        def replacer(match):
+            thinking_content = match.group(1).strip()
+            formatted_lines = [f"> {line}" for line in thinking_content.splitlines()]
+            return "\n".join(formatted_lines)
+
+        formatted_text = regex.sub(replacer, text)
+        return formatted_text
+
     async def pipe(
         self, body: Dict, __event_emitter__=None
     ) -> Union[str, Generator, Iterator]:
@@ -268,8 +308,8 @@ class Pipe:
             if "model" not in body:
                 raise ValueError("Model name is required")
 
-            model_name = body["model"].split("/")[-1]
-            max_tokens_limit = self.MODEL_MAX_TOKENS.get(model_name, 4096)
+            model_id = self.get_model_id(body["model"])
+            max_tokens_limit = self.MODEL_MAX_TOKENS.get(model_id, 8192)
 
             if system_message:
                 processed_messages.insert(
@@ -277,7 +317,7 @@ class Pipe:
                 )
 
             payload = {
-                "model": model_name,
+                "model": model_id,
                 "messages": processed_messages,
                 "max_tokens": min(
                     body.get("max_tokens", max_tokens_limit), max_tokens_limit
@@ -304,7 +344,7 @@ class Pipe:
 
             if payload["stream"]:
                 return self._stream_response(
-                    url=self.API_URL,
+                    url=f"{self.valves.DEEPSEEK_BASE_URL}/chat/completions",
                     headers=headers,
                     payload=payload,
                     __event_emitter__=__event_emitter__,
@@ -312,7 +352,9 @@ class Pipe:
 
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    self.API_URL, headers=headers, json=payload
+                    f"{self.valves.DEEPSEEK_BASE_URL}/chat/completions",
+                    headers=headers,
+                    json=payload,
                 ) as response:
                     if response.status != 200:
                         error_msg = (
@@ -332,7 +374,19 @@ class Pipe:
 
                     result = await response.json()
                     if "choices" in result and len(result["choices"]) > 0:
-                        response_text = result["choices"][0]["message"]["content"]
+                        message = result["choices"][0]["message"]
+                        content = message.get("content") or ""
+                        reasoning_content = message.get("reasoning_content") or ""
+
+                        # Combine content and reasoning with XML tags
+                        combined_content = ""
+                        if reasoning_content:
+                            combined_content += f"<{self.valves.THINK_XML_TAG}>\n{reasoning_content.strip()}\n</{self.valves.THINK_XML_TAG}>\n\n"
+                        combined_content += content
+
+                        # Apply formatting
+                        final_response = self.format_thinking_tags(combined_content)
+
                         if __event_emitter__:
                             await __event_emitter__(
                                 {
@@ -343,7 +397,7 @@ class Pipe:
                                     },
                                 }
                             )
-                        return response_text
+                        return final_response
                     return ""
 
         except Exception as e:
@@ -385,34 +439,69 @@ class Pipe:
                         yield error_msg
                         return
 
+                    reasoning_content = ""
+                    content = ""
+                    reasoning_yielded = False
+
                     async for line in response.content:
                         if line and line.startswith(b"data: "):
                             try:
                                 data = json.loads(line[6:])
-                                if (
-                                    "choices" in data
-                                    and len(data["choices"]) > 0
-                                    and "delta" in data["choices"][0]
-                                    and "content" in data["choices"][0]["delta"]
-                                ):
-                                    yield data["choices"][0]["delta"]["content"]
-                                if (
-                                    "choices" in data
-                                    and len(data["choices"]) > 0
-                                    and "finish_reason" in data["choices"][0]
-                                    and data["choices"][0]["finish_reason"] == "stop"
-                                ):
-                                    if __event_emitter__:
-                                        await __event_emitter__(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": "Request completed",
-                                                    "done": True,
-                                                },
-                                            }
-                                        )
-                                    break
+                                if "choices" in data and len(data["choices"]) > 0:
+                                    delta = data["choices"][0].get("delta", {})
+
+                                    # Accumulate reasoning content
+                                    if (
+                                        "reasoning_content" in delta
+                                        and delta["reasoning_content"]
+                                    ):
+                                        reasoning_content += delta["reasoning_content"]
+
+                                    # Handle content chunks
+                                    if "content" in delta and delta["content"]:
+                                        content_chunk = delta["content"]
+                                        content += content_chunk
+
+                                        # If reasoning hasn't been yielded yet, process and yield it
+                                        if (
+                                            not reasoning_yielded
+                                            and reasoning_content.strip()
+                                        ):
+                                            formatted_reasoning = self.format_thinking_tags(
+                                                f"<{self.valves.THINK_XML_TAG}>\n{reasoning_content.strip()}\n</{self.valves.THINK_XML_TAG}>"
+                                            )
+                                            yield formatted_reasoning + "\n\n"
+                                            reasoning_yielded = True
+
+                                        yield content_chunk
+
+                                    # Handle stream completion
+                                    if (
+                                        data["choices"][0].get("finish_reason")
+                                        == "stop"
+                                    ):
+                                        # Yield remaining reasoning first
+                                        if (
+                                            not reasoning_yielded
+                                            and reasoning_content.strip()
+                                        ):
+                                            formatted_reasoning = self.format_thinking_tags(
+                                                f"<{self.valves.THINK_XML_TAG}>\n{reasoning_content.strip()}\n</{self.valves.THINK_XML_TAG}>"
+                                            )
+                                            yield f"{formatted_reasoning}\n\n"
+
+                                        # Emit completion status
+                                        if __event_emitter__:
+                                            await __event_emitter__(
+                                                {
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": "Request completed",
+                                                        "done": True,
+                                                    },
+                                                }
+                                            )
+                                        break
                             except json.JSONDecodeError as e:
                                 logging.error(
                                     f"Failed to parse streaming response: {e}"
